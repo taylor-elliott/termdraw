@@ -9,7 +9,9 @@ edges to build a graph / mind-map.
 
 Rendering uses a braille sub-cell grid (each character cell = 2x4 dots, 8x the
 resolution of text) and pixel-level mouse tracking on terminals that support
-SGR-Pixels mode (WezTerm, kitty, recent xterm); falls back to cell-level.
+SGR-Pixels mode (WezTerm, kitty, foot, ghostty, contour); falls back to
+cell-level elsewhere (e.g. iTerm2, which reports a pixel cell size but doesn't
+implement ?1016). Override with DRAW_PIXEL_MOUSE=1/0.
 
 BOARD controls
   mouse        click select   drag move   double-click [↗] tab to open
@@ -200,6 +202,37 @@ def get_winsize(fd):
         return 24, 80, 0, 0
 
 
+def pixel_mouse_supported():
+    """Does this terminal implement SGR-Pixel mouse reporting (CSI ?1016)?
+
+    Several terminals (notably iTerm2) report a pixel cell size via
+    TIOCGWINSZ but ignore ?1016 and keep sending *cell* coordinates. Trusting
+    pixel mode there scales those small cell numbers as if they were pixels,
+    which collapses the cursor toward the top-left and desyncs it from the
+    drawing. So only enable pixel mode on terminals known to support ?1016.
+    Set DRAW_PIXEL_MOUSE=1/0 to force it on/off.
+    """
+    force = os.environ.get("DRAW_PIXEL_MOUSE", "").strip().lower()
+    if force in ("1", "on", "true", "yes"):
+        return True
+    if force in ("0", "off", "false", "no"):
+        return False
+    env = os.environ
+    term = env.get("TERM", "")
+    prog = env.get("TERM_PROGRAM", "")
+    if prog == "WezTerm" or env.get("WEZTERM_EXECUTABLE"):
+        return True
+    if "kitty" in term or env.get("KITTY_WINDOW_ID"):
+        return True
+    if term.startswith("foot"):
+        return True
+    if prog == "contour" or env.get("CONTOUR_VERSION"):
+        return True
+    if prog == "ghostty" or env.get("GHOSTTY_RESOURCES_DIR"):
+        return True
+    return False
+
+
 def rgbhex(c):
     return "#%02x%02x%02x" % (c[0], c[1], c[2])
 
@@ -315,7 +348,7 @@ class App:
         # reserve bottom row for status
         self.dw, self.dh = cols * 2, (rows - 1) * 4
         self.status_row = rows
-        self.pixel_mode = xpix > 0 and ypix > 0
+        self.pixel_mode = xpix > 0 and ypix > 0 and pixel_mouse_supported()
         self.cell_px = (xpix / cols) if self.pixel_mode else 1.0
         self.cell_py = (ypix / rows) if self.pixel_mode else 1.0
         self.ppx = self.cell_px / 2

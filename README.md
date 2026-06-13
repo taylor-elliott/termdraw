@@ -15,9 +15,13 @@ python3 draw.py --canvas     # jump straight into a single canvas
 python3 draw.py --help       # all options
 ```
 
-- Works best in a terminal with pixel-level mouse + truecolor (WezTerm, kitty, recent xterm)
+- Works best in a terminal with pixel-level mouse + truecolor (WezTerm, kitty, foot, ghostty, contour)
 
-- Falls back to cell-level mouse elsewhere
+- Falls back to cell-level mouse elsewhere — including **iTerm2** and Terminal.app, which report a pixel cell size but don't implement SGR-Pixel mouse (`CSI ?1016`). Forcing pixel mode there desyncs the cursor from where you draw, so it's auto-disabled.
+
+- Override the auto-detection with `DRAW_PIXEL_MOUSE=1` (force on) or `DRAW_PIXEL_MOUSE=0` (force off)
+
+> **iTerm2 right-click:** by default iTerm2 binds right-click to its own context menu, so plain right-click never reaches the app. Use `⌘`+right-click, or free up the binding in *Settings → Pointer*. Every menu action also has a key (`d` delete, `r` rename, `l` link, `Enter` open, `n` new node) and in the canvas the `e` eraser tool replaces right-drag.
 
 ## Board
 
