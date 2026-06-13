@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+.claude/
+.claude/*
+
 # C extensions
 *.so
 
@@ -75,3 +78,4 @@ Thumbs.db
 
 # dotenv
 .env
+.claude/

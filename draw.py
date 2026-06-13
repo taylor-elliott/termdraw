@@ -12,7 +12,7 @@ resolution of text) and pixel-level mouse tracking on terminals that support
 SGR-Pixels mode (WezTerm, kitty, recent xterm); falls back to cell-level.
 
 BOARD controls
-  mouse        click select   drag move   double-click open
+  mouse        click select   drag move   double-click [↗] tab to open
   keys         n new node   Enter open   d delete   l link   r rename
                Tab cycle   s save   o open   q quit   ? help
 
@@ -38,6 +38,7 @@ import re
 import math
 import json
 import signal
+import time
 
 USAGE = """draw — a node/graph terminal sketcher
 
@@ -85,11 +86,15 @@ LINK_COLOR = (120, 200, 120)
 HOVER_COLOR = (90, 200, 230)
 MENU_BORDER = (205, 205, 220)
 MENU_TEXT = (225, 225, 235)
+TAB_COLOR = (110, 180, 215)            # open-tab on each node's top-right
+TAB_HOVER = (245, 205, 90)             # tab when the mouse is over it
 SELECT_HL = (120, 220, 255)            # highlight for selected shapes
 MARQUEE_COLOR = (180, 180, 205)        # selection rectangle outline
 BAR_BG, BAR_FG, PROMPT_BG = 236, 252, 24
 SETTINGS_BG = 22
 NODE_W, NODE_H = 22, 8                  # node box size in cells
+TAB_LABEL = "[↗]"                       # double-click opens the node's canvas
+DOUBLE_CLICK_S = 0.4                    # max gap between the two tab clicks
 
 BOX_TL, BOX_TR, BOX_BL, BOX_BR = "┌", "┐", "└", "┘"
 BOX_H, BOX_V = "─", "│"
@@ -219,6 +224,8 @@ class App:
         self.dragging = None
         self.link_from = None
         self.hover = None
+        self.hover_tab = None           # node id whose open-tab the mouse is over
+        self.last_tab_click = (None, 0.0)   # (node id, time) for double-click
         self.menu = None
         self.press_cell = (0, 0)
         self.press_moved = False
@@ -821,6 +828,20 @@ class App:
     def node_center(self, n):
         return (n["bx"] + n["w"] // 2, n["by"] + n["h"] // 2)
 
+    def tab_span(self, n):
+        """Cells of the open-tab on a node's top border: (row, col0, col1)."""
+        row = n["by"]
+        col1 = n["bx"] + n["w"] - 2          # one cell left of the ┐ corner
+        col0 = col1 - (len(TAB_LABEL) - 1)
+        return row, col0, col1
+
+    def tab_at(self, col, row):
+        for n in reversed(self.nodes):
+            r, c0, c1 = self.tab_span(n)
+            if row == r and c0 <= col <= c1:
+                return n
+        return None
+
     def in_any_box(self, col, row):
         return self.node_at(col, row) is not None
 
@@ -986,6 +1007,10 @@ class App:
             target[(y0, x0 + i)] = (ch, accent)
         for i, ch in enumerate(bottom):
             target[(y0 + h - 1, x0 + i)] = (ch, accent)
+        trow, tc0, _ = self.tab_span(n)
+        tcolor = TAB_HOVER if n["id"] == self.hover_tab else TAB_COLOR
+        for i, ch in enumerate(TAB_LABEL):
+            target[(trow, tc0 + i)] = (ch, tcolor)
         for ry in range(1, h - 1):
             target[(y0 + ry, x0)] = (BOX_V, accent)
             target[(y0 + ry, x0 + w - 1)] = (BOX_V, accent)
@@ -1050,21 +1075,26 @@ class App:
         self.mouse_cell = (col, row)
         hovered = self.node_at(col, row)
         hid = hovered["id"] if hovered else None
-        hover_changed = hid != self.hover
+        tab = self.tab_at(col, row)
+        tid = tab["id"] if tab else None
+        changed = (hid != self.hover) or (tid != self.hover_tab)
         self.hover = hid
+        self.hover_tab = tid
         if final == "m":
             self.dragging = None      # click only selects/drags; Enter opens
-            if hover_changed:
+            if changed:
                 self.render_board()
             return
         if not (b & 32):
             if (b & 3) == 2:
                 self.open_menu(col, row)     # right-click -> context menu
+            elif tab is not None:
+                self.tab_press(tab)          # double-click the tab to open
             else:
                 self.board_press(col, row, b & 3)
         elif self.dragging:
             self.board_drag(col, row)
-        elif hover_changed:
+        elif changed:
             self.render_board()       # plain hover motion
 
     def board_press(self, col, row, button):
@@ -1092,6 +1122,22 @@ class App:
             self.dragging = None
             self.render_board()
             self.status()
+
+    def tab_press(self, node):
+        """A press on a node's open-tab; the second within DOUBLE_CLICK_S opens it."""
+        nid = node["id"]
+        now = time.monotonic()
+        last_id, last_t = self.last_tab_click
+        self.selected = nid
+        self.dragging = None          # grabbing the tab never starts a drag
+        if last_id == nid and (now - last_t) <= DOUBLE_CLICK_S:
+            self.last_tab_click = (None, 0.0)
+            self.open_node(node)
+            return
+        self.last_tab_click = (nid, now)
+        self.flash = "double-click the tab to open"
+        self.render_board()
+        self.status()
 
     def board_drag(self, col, row):
         node, offc, offr = self.dragging
@@ -1799,6 +1845,7 @@ class App:
                 "",
                 "  click        select a node",
                 "  drag         move a node",
+                "  dbl-click    the [↗] tab (top-right) opens that node",
                 "  right-click  menu: enter / rename / copy / link / delete",
                 "               (on empty space: new node / new board)",
                 "",
