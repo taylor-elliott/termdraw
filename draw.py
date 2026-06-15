@@ -48,9 +48,16 @@ usage: python3 draw.py [options] [name]
 
 options:
   -q, --canvas, --draw  open straight into a single canvas (no board)
+  -c, --config PATH     settings file to load/save (default: ~/.draw.json;
+                        also honoured via the DRAW_CONFIG env var)
   -h, --help            show this help
 
   name                  default board/file basename (default: draw)
+
+startup:
+  On launch the board named by the "Auto-open file name" setting (or the
+  given name) is opened from the "Auto-open directory" (or the open/work
+  directory). Toggle "Auto-open a board on launch" in Settings to disable.
 
 modes:
   board    nodes you can draw in, link, and arrange (default)
@@ -88,14 +95,14 @@ LINK_COLOR = (120, 200, 120)
 HOVER_COLOR = (90, 200, 230)
 MENU_BORDER = (205, 205, 220)
 MENU_TEXT = (225, 225, 235)
-TAB_COLOR = (110, 180, 215)            # open-tab on each node's top-right
-TAB_HOVER = (245, 205, 90)             # tab when the mouse is over it
-SELECT_HL = (120, 220, 255)            # highlight for selected shapes
+TAB_COLOR = (110, 180, 215)
+TAB_HOVER = (245, 205, 90)
+SELECT_HL = (120, 220, 255)
 MARQUEE_COLOR = (180, 180, 205)        # selection rectangle outline
 BAR_BG, BAR_FG, PROMPT_BG = 236, 252, 24
 SETTINGS_BG = 22
 NODE_W, NODE_H = 22, 8                  # node box size in cells
-TAB_LABEL = "[↗]"                       # double-click opens the node's canvas
+TAB_LABEL = "[↗]"
 DOUBLE_CLICK_S = 0.4                    # max gap between the two tab clicks
 
 BOX_TL, BOX_TR, BOX_BL, BOX_BR = "┌", "┐", "└", "┘"
@@ -112,6 +119,7 @@ BOARD_BIND = [
     ("rename", "Rename", "r"),
     ("save", "Save board", "s"),
     ("open", "Open board", "o"),
+    ("boards", "Browse boards", "b"),
     ("settings", "Settings", ","),
 ]
 CANVAS_BIND = [
@@ -143,6 +151,8 @@ def default_keymap():
 def default_config():
     return {
         "work_dir": "", "save_dir": "", "open_dir": "",
+        "autoload": True, "autoload_file": "", "autoload_dir": "",
+        "last_board": "",
         "hover_recolor_selected": False,
         "show_hint_labels": True,
         "hide_ui": False,
@@ -238,9 +248,11 @@ def rgbhex(c):
 
 
 class App:
-    def __init__(self, basename="draw", canvas=False):
+    def __init__(self, basename=".draw", canvas=False, config_path=None):
         self.fd = sys.stdin.fileno()
         self.canvas = canvas
+        self.config_path = (os.path.expanduser(config_path)
+                            if config_path else CONFIG_PATH)
         self._measure()
         self._disk_cache = {}
         self.cfg = self.load_config()
@@ -298,6 +310,11 @@ class App:
         self.settings_top = 0
         self.capture_action = None
 
+        # ---- board browser state ----
+        self.board_list = []
+        self.board_hover = 0
+        self.board_top = 0
+
         self.last_name = basename
         self.prompt_mode = None
         self.prompt_buf = ""
@@ -313,7 +330,7 @@ class App:
     def load_config(self):
         cfg = default_config()
         try:
-            with open(CONFIG_PATH) as f:
+            with open(self.config_path) as f:
                 data = json.load(f)
             for k, v in data.items():
                 if k == "keymap" and isinstance(v, dict):
@@ -326,10 +343,23 @@ class App:
 
     def save_config(self):
         try:
-            with open(CONFIG_PATH, "w") as f:
+            d = os.path.dirname(self.config_path)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(self.config_path, "w") as f:
                 json.dump(self.cfg, f, indent=2)
         except Exception:
             pass
+
+    def _tilde(self, p):
+        home = os.path.expanduser("~")
+        return "~" + p[len(home):] if p.startswith(home) else p
+
+    def _remember_board(self, path):
+        path = os.path.abspath(path)
+        if self.cfg.get("last_board") != path:
+            self.cfg["last_board"] = path
+            self.save_config()
 
     def rebuild_keymaps(self):
         km = self.cfg["keymap"]
@@ -1024,13 +1054,11 @@ class App:
         recolor_sel = self.cfg.get("hover_recolor_selected", False)
         accent = NODE_COLOR
         if n["id"] == self.hover and (recolor_sel or n["id"] != self.selected):
-            # by default hover never recolors the selected node; while linking the
-            # hovered target turns yellow to show which node will be linked
             accent = SEL_COLOR if linking else HOVER_COLOR
         if n["id"] == self.selected and not (linking and n["id"] == self.hover):
             accent = SEL_COLOR
         if n["id"] == self.link_from:
-            accent = LINK_COLOR            # link source stays green
+            accent = LINK_COLOR
         x0, y0, w, h = n["bx"], n["by"], n["w"], n["h"]
         inner = w - 2
         label = (" " + n["title"] + " ")[:inner]
@@ -1114,7 +1142,7 @@ class App:
         self.hover = hid
         self.hover_tab = tid
         if final == "m":
-            self.dragging = None      # click only selects/drags; Enter opens
+            self.dragging = None
             if changed:
                 self.render_board()
             return
@@ -1334,10 +1362,17 @@ class App:
                 self.running = False
             else:
                 self.status()
+        elif kind == "switch_board":
+            if key == "o":
+                self.do_load_board_path(data)
+            else:
+                self.flash = "cancelled"
+                self.render_boards()
+                self.status()
         elif kind == "overwrite":
             if key == "y":
                 self.do_save_board(data)
-            elif key == "r":                 # save under a different name
+            elif key == "r":
                 self.begin_prompt("save_board")
                 self.prompt_buf = data       # prefill the attempted name to edit
                 self.status()
@@ -1364,6 +1399,13 @@ class App:
             {"type": "path", "label": "Working directory", "key": "work_dir"},
             {"type": "path", "label": "Save directory", "key": "save_dir"},
             {"type": "path", "label": "Open directory", "key": "open_dir"},
+            {"type": "header", "label": "Startup"},
+            {"type": "toggle", "label": "Auto-open a board on launch",
+             "key": "autoload"},
+            {"type": "path", "label": "Auto-open file name", "key": "autoload_file"},
+            {"type": "path", "label": "Auto-open directory", "key": "autoload_dir"},
+            {"type": "info", "label": "Settings file",
+             "value": self._tilde(self.config_path)},
             {"type": "header", "label": "Keymap — board"},
         ]
         for a, label, _ in BOARD_BIND:
@@ -1391,6 +1433,8 @@ class App:
             return str(self.cfg.get(key))
         if t == "path":
             return self.cfg.get(key) or "(default)"
+        if t == "info":
+            return row.get("value", "")
         if t == "key":
             return self._keyname(self.cfg["keymap"].get(key, "?"))
         return ""
@@ -1404,12 +1448,25 @@ class App:
         elif key == "default_erase":
             self.erase_r = self.cfg["default_erase"]
 
+    def _settings_view_h(self):
+        return max(1, self.status_row - 3)
+
+    def _selectable_row(self, row):
+        return row["type"] not in ("header", "info")
+
+    def _ensure_hover_visible(self):
+        view_h = self._settings_view_h()
+        if self.settings_hover < self.settings_top:
+            self.settings_top = self.settings_hover
+        elif self.settings_hover >= self.settings_top + view_h:
+            self.settings_top = self.settings_hover - view_h + 1
+
     def open_settings(self):
         self.mode = "settings"
         self.settings_rows = self.build_settings_rows()
         self.settings_top = 0
         self.settings_hover = next((i for i, r in enumerate(self.settings_rows)
-                                    if r["type"] != "header"), 0)
+                                    if self._selectable_row(r)), 0)
         self.displayed = {}
         self.txt = {}
         self.write([f"{ESC}[2J"])
@@ -1428,16 +1485,15 @@ class App:
 
     def render_settings(self):
         target = {}
-        title = "  SETTINGS  ·  saved to ~/.draw.json"
+        title = "  SETTINGS  ·  saved to " + self._tilde(self.config_path)
         for i, ch in enumerate(title[:self.cols]):
             target[(1, 1 + i)] = (ch, SEL_COLOR)
         top_row = 3
-        view_h = max(1, self.status_row - top_row)
+        view_h = self._settings_view_h()
         rows = self.settings_rows
-        if self.settings_hover < self.settings_top:
-            self.settings_top = self.settings_hover
-        elif self.settings_hover >= self.settings_top + view_h:
-            self.settings_top = self.settings_hover - view_h + 1
+        # page scroll is independent of the hovered row; just keep it in range
+        max_top = max(0, len(rows) - view_h)
+        self.settings_top = max(0, min(self.settings_top, max_top))
         label_col = 3
         val_col = min(max(38, self.cols - 24), self.cols - 6)
         for vi in range(view_h):
@@ -1466,11 +1522,18 @@ class App:
         rows = self.settings_rows
         step = 1 if delta > 0 else -1
         i = self.settings_hover + step
-        while 0 <= i < len(rows) and rows[i]["type"] == "header":
+        while 0 <= i < len(rows) and not self._selectable_row(rows[i]):
             i += step
         if 0 <= i < len(rows):
             self.settings_hover = i
+            self._ensure_hover_visible()
             self.render_settings()
+
+    def settings_wheel(self, delta):
+        view_h = self._settings_view_h()
+        max_top = max(0, len(self.settings_rows) - view_h)
+        self.settings_top = max(0, min(self.settings_top + delta, max_top))
+        self.render_settings()
 
     def activate_setting(self, ri):
         if not (0 <= ri < len(self.settings_rows)):
@@ -1507,7 +1570,7 @@ class App:
                 self.close_settings()
 
     def finish_capture(self, ch):
-        if ch in ("\x03", "ESC"):              # Ctrl-C / Esc cancels
+        if ch in ("\x03", "ESC"):
             self.capture_action = None
             self.flash = "cancelled"
         elif len(ch) == 1:                     # bind a single key
@@ -1522,12 +1585,12 @@ class App:
 
     def handle_settings_mouse(self, b, x, y, final):
         if b & 64:
-            self.settings_scroll(1 if (b & 1) else -1)
+            self.settings_wheel(3 if (b & 1) else -3)
             return
         col, row = self.to_cell(x, y)
         ri = self.settings_top + (row - 3)
         valid = (0 <= ri < len(self.settings_rows)
-                 and self.settings_rows[ri]["type"] != "header")
+                 and self._selectable_row(self.settings_rows[ri]))
         if final == "m":
             if valid:
                 self.settings_hover = ri
@@ -1593,6 +1656,8 @@ class App:
             self.begin_prompt("save_board")
         elif act == "open":
             self.begin_prompt("open_board")
+        elif act == "boards":
+            self.open_boards()
         elif act == "settings":
             self.open_settings()
 
@@ -1682,6 +1747,7 @@ class App:
             with open(path, "w") as f:
                 json.dump(data, f)
             self.last_name = self._stem(name)
+            self._remember_board(path)
             self.flash = f"saved {path} ({len(self.nodes)} nodes)"
             saved = True
             self.dirty = False
@@ -1692,32 +1758,231 @@ class App:
             self.quit_after_save = False
             self.running = False
 
-    def do_load_board(self, name):
-        path = self._resolve(self._with_ext(name, ".json"), "open")
+    def _apply_board_data(self, data):
+        self.nodes = []
+        for nd in data.get("nodes", []):
+            shapes = nd.get("shapes", [])
+            self.nodes.append({
+                "id": nd["id"], "title": nd.get("title", f"canvas {nd['id']}"),
+                "bx": nd.get("bx", 2), "by": nd.get("by", 2),
+                "w": nd.get("w", NODE_W), "h": nd.get("h", NODE_H),
+                "shapes": shapes, "hist": [shapes], "hidx": 0, "_prev": None})
+        self.edges = [list(e) for e in data.get("edges", [])]
+        self.next_id = data.get("next_id",
+                                max((n["id"] for n in self.nodes), default=0) + 1)
+        self.selected = self.nodes[0]["id"] if self.nodes else None
+        self.dirty = False
+
+    def _autoload_path(self, stem):
+        name = self._with_ext(stem, ".json")
+        adir = self.cfg.get("autoload_dir")
+        if adir and not os.path.isabs(os.path.expanduser(name)):
+            return os.path.join(os.path.expanduser(adir), name)
+        return self._resolve(name, "open")
+
+    def autoload_board(self):
+        """On startup, open a saved board if auto-open is enabled. We try the
+        `autoload_file` override first, then the last board worked on, then the
+        launch basename — opening the first one that exists. Paths resolve
+        against `autoload_dir` (or the open/work directory)."""
+        if not self.cfg.get("autoload", True):
+            return
+        path = None
+        for stem in (self.cfg.get("autoload_file"),
+                     self.cfg.get("last_board"), self.last_name):
+            if not stem:
+                continue
+            p = self._autoload_path(stem)
+            if os.path.exists(p):
+                path = p
+                break
+        if not path:
+            return
         try:
             with open(path) as f:
                 data = json.load(f)
-            self.nodes = []
-            for nd in data.get("nodes", []):
-                shapes = nd.get("shapes", [])
-                self.nodes.append({
-                    "id": nd["id"], "title": nd.get("title", f"canvas {nd['id']}"),
-                    "bx": nd.get("bx", 2), "by": nd.get("by", 2),
-                    "w": nd.get("w", NODE_W), "h": nd.get("h", NODE_H),
-                    "shapes": shapes, "hist": [shapes], "hidx": 0, "_prev": None})
-            self.edges = [list(e) for e in data.get("edges", [])]
-            self.next_id = data.get("next_id",
-                                    max((n["id"] for n in self.nodes), default=0) + 1)
-            self.selected = self.nodes[0]["id"] if self.nodes else None
-            self.flash = f"opened {path} ({len(self.nodes)} nodes)"
-            self.dirty = False
         except Exception as e:
             self.flash = f"open failed: {e}"
+            return
+        self._apply_board_data(data)
+        self.last_name = self._stem(os.path.basename(path))
+        self._remember_board(path)
+        self.flash = f"opened {path} ({len(self.nodes)} nodes)"
+
+    def do_load_board(self, name):
+        self.do_load_board_path(self._resolve(self._with_ext(name, ".json"),
+                                              "open"))
+
+    def do_load_board_path(self, path):
+        try:
+            with open(path) as f:
+                data = json.load(f)
+            self._apply_board_data(data)
+            self.last_name = self._stem(os.path.basename(path))
+            self._remember_board(path)
+            self.flash = f"opened {path} ({len(self.nodes)} nodes)"
+        except Exception as e:
+            self.flash = f"open failed: {e}"
+        self.mode = "board"
         self.displayed = {}
         self.txt = {}
         self.write([f"{ESC}[2J"])
         self.render_board()
         self.status()
+
+    # ============================ BOARD BROWSER ============================
+    def _boards_dir(self):
+        base = self.cfg.get("open_dir") or self.cfg.get("work_dir") or "."
+        return os.path.expanduser(base)
+
+    def _list_board_files(self):
+        d = self._boards_dir()
+        try:
+            names = sorted(os.listdir(d))
+        except OSError:
+            names = []
+        cfgpath = os.path.abspath(self.config_path)
+        items = []
+        for nm in names:
+            if not nm.endswith(".json"):
+                continue
+            path = os.path.join(d, nm)
+            if os.path.abspath(path) == cfgpath:   # skip the settings file
+                continue
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+                if not isinstance(data, dict) or "nodes" not in data:
+                    continue                       # not a board file
+                count = len(data.get("nodes", []))
+            except Exception:
+                continue
+            items.append(
+                {"name": self._stem(nm), "path": path, "count": count})
+        return items
+
+    def open_boards(self):
+        self._sync_active_node()
+        self.mode = "boards"
+        self.board_list = self._list_board_files()
+        self.board_top = 0
+        self.board_hover = next((i for i, b in enumerate(self.board_list)
+                                 if b["name"] == self.last_name), 0)
+        self.displayed = {}
+        self.txt = {}
+        self.write([f"{ESC}[2J"])
+        self.render_boards()
+        self.status()
+
+    def close_boards(self):
+        self.mode = "board"
+        self.displayed = {}
+        self.txt = {}
+        self.write([f"{ESC}[2J"])
+        self.render_board()
+        self.status()
+
+    def render_boards(self):
+        target = {}
+        title = "  BOARDS  ·  " + self._tilde(self._boards_dir())
+        for i, ch in enumerate(title[:self.cols]):
+            target[(1, 1 + i)] = (ch, SEL_COLOR)
+        top_row = 3
+        view_h = max(1, self.status_row - top_row)
+        rows = self.board_list
+        if not rows:
+            msg = "  no boards here — press n to start a new one"
+            for i, ch in enumerate(msg[:self.cols]):
+                target[(top_row, 3 + i)] = (ch, NODE_COLOR)
+            self.draw_text_target(target)
+            return
+        max_top = max(0, len(rows) - view_h)
+        self.board_top = max(0, min(self.board_top, max_top))
+        label_col = 3
+        val_col = min(max(38, self.cols - 16), self.cols - 2)
+        for vi in range(view_h):
+            ri = self.board_top + vi
+            if ri >= len(rows):
+                break
+            b = rows[ri]
+            sr = top_row + vi
+            hovered = (ri == self.board_hover)
+            current = (b["name"] == self.last_name)
+            mark = "▸ " if hovered else ("● " if current else "  ")
+            label = mark + b["name"] + ("  (current)" if current else "")
+            lcolor = SEL_COLOR if hovered else (LINK_COLOR if current
+                                                else MENU_TEXT)
+            for i, ch in enumerate(label[:val_col - label_col - 1]):
+                target[(sr, label_col + i)] = (ch, lcolor)
+            cnt = f"{b['count']} node(s)" if b["count"] is not None else ""
+            vcolor = SEL_COLOR if hovered else HOVER_COLOR
+            for i, ch in enumerate(cnt[:self.cols - val_col]):
+                target[(sr, val_col + i)] = (ch, vcolor)
+        self.draw_text_target(target)
+
+    def boards_scroll(self, delta):
+        rows = self.board_list
+        if not rows:
+            return
+        self.board_hover = max(0, min(self.board_hover + (1 if delta > 0 else -1),
+                                      len(rows) - 1))
+        view_h = max(1, self.status_row - 3)
+        if self.board_hover < self.board_top:
+            self.board_top = self.board_hover
+        elif self.board_hover >= self.board_top + view_h:
+            self.board_top = self.board_hover - view_h + 1
+        self.render_boards()
+
+    def boards_wheel(self, delta):
+        view_h = max(1, self.status_row - 3)
+        max_top = max(0, len(self.board_list) - view_h)
+        self.board_top = max(0, min(self.board_top + delta, max_top))
+        self.render_boards()
+
+    def boards_open_selected(self):
+        if not self.board_list:
+            return
+        b = self.board_list[self.board_hover]
+        if b["name"] == self.last_name and not self.dirty:
+            self.close_boards()                # already on this board
+            return
+        if self.dirty:
+            self.ask_confirm("Unsaved changes will be lost.",
+                             [("o", "open anyway"), ("c", "cancel")],
+                             kind="switch_board", data=b["path"])
+            return
+        self.do_load_board_path(b["path"])
+
+    def handle_boards_key(self, ch):
+        if ch in ("q", "\x03", "ESC"):
+            self.close_boards()
+        elif ch in ("\r", "\n"):
+            self.boards_open_selected()
+        elif ch in ("j", "DOWN", "\t"):
+            self.boards_scroll(1)
+        elif ch in ("k", "UP"):
+            self.boards_scroll(-1)
+        elif ch == "n":
+            self.mode = "board"
+            self.new_board()
+
+    def handle_boards_mouse(self, b, x, y, final):
+        if b & 64:
+            self.boards_wheel(3 if (b & 1) else -3)
+            return
+        if not self.board_list:
+            return
+        col, row = self.to_cell(x, y)
+        ri = self.board_top + (row - 3)
+        valid = 0 <= ri < len(self.board_list)
+        if final == "m":
+            if valid:
+                self.board_hover = ri
+                self.boards_open_selected()
+            return
+        if valid and ri != self.board_hover:
+            self.board_hover = ri
+            self.render_boards()
 
     def do_export(self, name):
         path = self._resolve(self._with_ext(name, ".svg"), "save")
@@ -1825,6 +2090,15 @@ class App:
             self.write([self.bar(text[:self.cols], SETTINGS_BG)])
             self.flash = ""
             return
+        if self.mode == "boards":
+            text = (f" BOARDS  {len(self.board_list)} found   "
+                    "↑/↓ or scroll navigate   [Enter] open   "
+                    "[n] new   [q/Esc] back ")
+            if self.flash:
+                text = " " + self.flash + "   " + text
+            self.write([self.bar(text[:self.cols], SETTINGS_BG)])
+            self.flash = ""
+            return
         if self.mode == "board":
             sel = self.node_by_id(self.selected)
             seltxt = sel["title"] if sel else "-"
@@ -1835,6 +2109,7 @@ class App:
                 (bk("new_node"), "new"), (bk("new_board"), "new-board"),
                 (bk("link"), "link"), (bk("delete"), "del"),
                 (bk("save"), "save"), (bk("open"), "open"),
+                (bk("boards"), "boards"),
                 (bk("settings"), "settings"), ("q", "quit"), ("?", "help")])
             if self.flash:
                 right = "| " + self.flash + "  " + right
@@ -1889,6 +2164,7 @@ class App:
                 f"  {self._bkey('rename'):<5} rename node    (copy a node via right-click)",
                 "",
                 f"  {self._bkey('save'):<5} save board     {self._bkey('open'):<5} open board",
+                f"  {self._bkey('boards'):<5} browse & switch between saved boards",
                 f"  {self._bkey('settings'):<5} settings       `      hide/show the UI bar",
                 "  q     quit (asks to save if there are changes)",
                 "",
@@ -1938,6 +2214,8 @@ class App:
             self.render_board()
         elif self.mode == "settings":
             self.render_settings()
+        elif self.mode == "boards":
+            self.render_boards()
         else:
             self.rebuild_base()
             self.present()
@@ -1957,6 +2235,9 @@ class App:
         elif self.mode == "settings":
             self.render_settings()
             self.status()
+        elif self.mode == "boards":
+            self.render_boards()
+            self.status()
         elif self.mode == "board":
             self.render_board()
             self.status()
@@ -1973,6 +2254,8 @@ class App:
             return
         if self.mode == "settings":
             self.handle_settings_mouse(b, x, y, final)
+        elif self.mode == "boards":
+            self.handle_boards_mouse(b, x, y, final)
         elif self.mode == "board":
             self.handle_board_mouse(b, x, y, final)
         else:
@@ -2011,6 +2294,8 @@ class App:
             return
         if self.mode == "settings":
             self.handle_settings_key(ch)
+        elif self.mode == "boards":
+            self.handle_boards_key(ch)
         elif self.mode == "board":
             self.handle_board_key(ch)
         else:
@@ -2029,6 +2314,8 @@ class App:
             enable += f"{ESC}[?1016h"
         sys.stdout.write(enable)
         sys.stdout.flush()
+        if not self.nodes:
+            self.autoload_board()
         if not self.nodes:
             self.new_node(self.cols // 2, self.rows // 2)
         self.dirty = False                    # fresh session isn't "unsaved" yet
@@ -2096,8 +2383,23 @@ class App:
 
 
 if __name__ == "__main__":
-    flags = {a for a in sys.argv[1:] if a.startswith("-")}
-    positional = [a for a in sys.argv[1:] if not a.startswith("-")]
+    argv = sys.argv[1:]
+    config_path = os.environ.get("DRAW_CONFIG")
+    flags, positional = set(), []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-c", "--config"):
+            i += 1
+            if i < len(argv):
+                config_path = argv[i]
+        elif a.startswith("--config="):
+            config_path = a.split("=", 1)[1]
+        elif a.startswith("-"):
+            flags.add(a)
+        else:
+            positional.append(a)
+        i += 1
     if "-h" in flags or "--help" in flags:
         print(USAGE)
         sys.exit(0)
@@ -2105,4 +2407,4 @@ if __name__ == "__main__":
         sys.exit("Run this directly in a terminal (not piped).")
     canvas = bool(flags & {"-q", "--canvas", "--draw"})
     base = positional[0] if positional else "draw"
-    App(base, canvas=canvas).run()
+    App(base, canvas=canvas, config_path=config_path).run()
